@@ -1,1352 +1,629 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 const app = express();
-const PORT = 3001;
 
-// ============================================================
-// 기본 설정
-// ============================================================
+const PORT = 3000;
+
+/*
+|--------------------------------------------------------------------------
+| 기본 설정
+|--------------------------------------------------------------------------
+*/
+
+app.set('trust proxy', true);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ============================================================
-// 파일 경로
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| 로그 파일
+|--------------------------------------------------------------------------
+*/
 
-const USERS_FILE = path.join(__dirname, 'users.json');
-const SECURITY_LOG_FILE = path.join(__dirname, 'security.log');
+const LOG_FILE = path.join(__dirname, 'security.log');
 
-// ============================================================
-// 보안 정책
-// ============================================================
-
-// 한 계정에서 비밀번호를 5번 틀리면 계정 잠금
-const MAX_LOGIN_FAILURES = 5;
-
-// 계정 잠금 시간
-const ACCOUNT_LOCK_MINUTES = 5;
-
-// 한 IP에서 로그인 실패가 10번 발생하면 IP 차단
-const MAX_IP_FAILURES = 10;
-
-// IP 차단 시간
-const IP_BLOCK_MINUTES = 10;
-
-// ============================================================
-// 메모리 저장소
-// ============================================================
-
-// 로그인 세션
-const sessions = new Map();
-
-// IP별 로그인 실패 횟수
-const ipLoginFailures = new Map();
-
-// IP별 차단 종료 시간
-const blockedIps = new Map();
-
-// ============================================================
-// 필요한 파일 생성
-// ============================================================
-
-function ensureFile(filePath, initialValue) {
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, initialValue, 'utf8');
+function ensureLogFile() {
+  if (!fs.existsSync(LOG_FILE)) {
+    fs.writeFileSync(LOG_FILE, '', 'utf8');
   }
 }
 
-ensureFile(
-  USERS_FILE,
-  JSON.stringify(
-    {
-      users: [],
-    },
-    null,
-    2
-  )
-);
+ensureLogFile();
 
-ensureFile(
-  SECURITY_LOG_FILE,
-  ''
-);
+/*
+|--------------------------------------------------------------------------
+| Rate Limiting
+|--------------------------------------------------------------------------
+| 같은 IP에서 로그인 요청을 너무 많이 보내면 차단
+|--------------------------------------------------------------------------
+*/
 
-// ============================================================
-// 사용자 데이터 읽기
-// ============================================================
+const loginAttempts = new Map();
 
-function readUsers() {
-  try {
-    const raw = fs.readFileSync(
-      USERS_FILE,
-      'utf8'
-    );
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1분
+const MAX_LOGIN_ATTEMPTS = 5; // 1분에 5회까지 허용
 
-    const data = JSON.parse(raw);
+/*
+|--------------------------------------------------------------------------
+| WAF 차단 패턴
+|--------------------------------------------------------------------------
+*/
 
-    if (!Array.isArray(data.users)) {
-      return {
-        users: [],
-      };
-    }
+const BLOCK_PATTERNS = [
+  // SQL Injection
 
-    return data;
-  } catch (error) {
-    console.error(
-      'users.json 읽기 실패:',
-      error
-    );
+  {
+    name: 'SQL_INJECTION_OR',
+    regex: /(\bor\b|\band\b)\s+[^&]*?(=|')/i,
+  },
 
-    return {
-      users: [],
-    };
-  }
+  {
+    name: 'SQL_INJECTION_UNION',
+    regex: /union\s+select/i,
+  },
+
+  {
+    name: 'SQL_INJECTION_SELECT_FROM',
+    regex: /select\s+.+\s+from/i,
+  },
+
+  {
+    name: 'SQL_INJECTION_DROP',
+    regex: /drop\s+table/i,
+  },
+
+  {
+    name: 'SQL_INJECTION_INSERT',
+    regex: /insert\s+into/i,
+  },
+
+  {
+    name: 'SQL_INJECTION_DELETE',
+    regex: /delete\s+from/i,
+  },
+
+  {
+    name: 'SQL_INJECTION_UPDATE',
+    regex: /update\s+.+\s+set/i,
+  },
+
+  // XSS
+
+  {
+    name: 'XSS_SCRIPT',
+    regex: /<script[\s>]/i,
+  },
+
+  {
+    name: 'XSS_JAVASCRIPT',
+    regex: /javascript\s*:/i,
+  },
+
+  {
+    name: 'XSS_ONERROR',
+    regex: /onerror\s*=/i,
+  },
+
+  {
+    name: 'XSS_ONLOAD',
+    regex: /onload\s*=/i,
+  },
+
+  // Path Traversal
+
+  {
+    name: 'PATH_TRAVERSAL_UNIX',
+    regex: /\.\.\//,
+  },
+
+  {
+    name: 'PATH_TRAVERSAL_WINDOWS',
+    regex: /\.\.\\/,
+  },
+];
+
+/*
+|--------------------------------------------------------------------------
+| 로그 값 정리
+|--------------------------------------------------------------------------
+*/
+
+function sanitizeLogValue(value) {
+  return String(value ?? '')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
 }
 
-// ============================================================
-// 사용자 데이터 저장
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| 로그 저장 함수
+|--------------------------------------------------------------------------
+*/
 
-function saveUsers(data) {
-  fs.writeFileSync(
-    USERS_FILE,
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
-    'utf8'
-  );
-}
-
-// ============================================================
-// IP 가져오기
-// ============================================================
-
-function getClientIp(req) {
-  return (
-    req.ip ||
-    req.socket?.remoteAddress ||
-    'unknown'
-  );
-}
-
-// ============================================================
-// 보안 로그 기록
-// ============================================================
-
-function writeSecurityLog(
-  type,
-  req,
-  extra = {}
-) {
+function writeLog(type, message, req, extra = {}) {
   const log = {
     time: new Date().toISOString(),
-
     type,
-
     method: req.method,
-
-    path: req.originalUrl,
-
-    ip: getClientIp(req),
-
+    path: sanitizeLogValue(req.originalUrl),
+    ip: req.ip,
+    message,
     ...extra,
   };
 
-  const line =
-    JSON.stringify(log);
+  const line = JSON.stringify(log);
 
   // 터미널 출력
   console.log(line);
 
-  // 파일 저장
-  fs.appendFileSync(
-    SECURITY_LOG_FILE,
-    `${line}\n`,
-    'utf8'
-  );
-}
-
-// ============================================================
-// 아이디 검사
-// ============================================================
-
-function isValidUsername(username) {
-  return /^[a-zA-Z0-9_]{4,20}$/.test(
-    username
-  );
-}
-
-// ============================================================
-// 비밀번호 검사
-// ============================================================
-
-function isValidPassword(password) {
-  return (
-    typeof password === 'string' &&
-    password.length >= 8
-  );
-}
-
-// ============================================================
-// 비밀번호 해시
-// ============================================================
-// Node.js 내장 crypto.scrypt 사용
-//
-// 비밀번호를 그대로 저장하지 않고
-// salt + hash 형태로 저장합니다.
-// ============================================================
-
-function hashPassword(password) {
-  return new Promise(
-    (resolve, reject) => {
-      const salt =
-        crypto.randomBytes(16)
-          .toString('hex');
-
-      crypto.scrypt(
-        password,
-        salt,
-        64,
-        (error, derivedKey) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-
-          resolve({
-            algorithm: 'scrypt',
-
-            salt,
-
-            hash:
-              derivedKey.toString(
-                'hex'
-              ),
-          });
-        }
-      );
+  // security.log 저장
+  fs.appendFile(LOG_FILE, `${line}\n`, 'utf8', (error) => {
+    if (error) {
+      console.error('로그 파일 저장 실패:', error);
     }
-  );
-}
-
-// ============================================================
-// 비밀번호 검증
-// ============================================================
-
-function verifyPassword(
-  password,
-  storedPassword
-) {
-  return new Promise(
-    (resolve, reject) => {
-      if (
-        !storedPassword ||
-        storedPassword.algorithm !==
-          'scrypt' ||
-        !storedPassword.salt ||
-        !storedPassword.hash
-      ) {
-        resolve(false);
-        return;
-      }
-
-      crypto.scrypt(
-        password,
-        storedPassword.salt,
-        64,
-        (error, derivedKey) => {
-          if (error) {
-            reject(error);
-            return;
-          }
-
-          const storedHash =
-            Buffer.from(
-              storedPassword.hash,
-              'hex'
-            );
-
-          if (
-            storedHash.length !==
-            derivedKey.length
-          ) {
-            resolve(false);
-            return;
-          }
-
-          const matched =
-            crypto.timingSafeEqual(
-              storedHash,
-              derivedKey
-            );
-
-          resolve(matched);
-        }
-      );
-    }
-  );
-}
-
-// ============================================================
-// IP 차단 여부 확인
-// ============================================================
-
-function isIpBlocked(ip) {
-  const blockedUntil =
-    blockedIps.get(ip);
-
-  // 차단 기록 없음
-  if (!blockedUntil) {
-    return false;
-  }
-
-  // 아직 차단 시간 안 끝남
-  if (
-    blockedUntil > Date.now()
-  ) {
-    return true;
-  }
-
-  // 차단 시간이 끝났다면 초기화
-  blockedIps.delete(ip);
-
-  ipLoginFailures.delete(ip);
-
-  return false;
-}
-
-// ============================================================
-// IP 로그인 실패 횟수 증가
-// ============================================================
-
-function registerIpFailure(ip) {
-  const currentCount =
-    ipLoginFailures.get(ip) ||
-    0;
-
-  const newCount =
-    currentCount + 1;
-
-  ipLoginFailures.set(
-    ip,
-    newCount
-  );
-
-  return newCount;
-}
-
-// ============================================================
-// IP 실패 횟수 가져오기
-// ============================================================
-
-function getIpFailureCount(ip) {
-  return (
-    ipLoginFailures.get(ip) ||
-    0
-  );
-}
-
-// ============================================================
-// IP 차단
-// ============================================================
-
-function blockIp(ip) {
-  const blockedUntil =
-    Date.now() +
-    IP_BLOCK_MINUTES *
-      60 *
-      1000;
-
-  blockedIps.set(
-    ip,
-    blockedUntil
-  );
-
-  return blockedUntil;
-}
-
-// ============================================================
-// 세션 생성
-// ============================================================
-
-function createSession(username) {
-  const token =
-    crypto.randomBytes(32)
-      .toString('hex');
-
-  sessions.set(token, {
-    username,
-
-    createdAt: Date.now(),
   });
-
-  return token;
 }
 
-// ============================================================
-// 세션 토큰 가져오기
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| 요청 데이터 가져오기
+|--------------------------------------------------------------------------
+*/
 
-function getSessionToken(req) {
-  const cookie =
-    req.headers.cookie || '';
+function getRequestText(req) {
+  return JSON.stringify({
+    url: req.originalUrl,
+    query: req.query,
+    body: req.body,
+    params: req.params,
+    userAgent: req.get('user-agent') || '',
+  });
+}
 
-  const sessionCookie =
-    cookie
-      .split(';')
-      .map((item) =>
-        item.trim()
-      )
-      .find((item) =>
-        item.startsWith(
-          'session='
-        )
-      );
+/*
+|--------------------------------------------------------------------------
+| WAF Middleware
+|--------------------------------------------------------------------------
+*/
 
-  if (!sessionCookie) {
-    return null;
-  }
+function wafMiddleware(req, res, next) {
+  const requestText = getRequestText(req);
 
-  return sessionCookie.slice(
-    'session='.length
+  const matchedPattern = BLOCK_PATTERNS.find(({ regex }) =>
+    regex.test(requestText)
   );
-}
 
-// ============================================================
-// 로그인 사용자 확인
-// ============================================================
+  /*
+  |--------------------------------------------------------------------------
+  | 공격 패턴 발견
+  |--------------------------------------------------------------------------
+  */
 
-function requireLogin(
-  req,
-  res,
-  next
-) {
-  const token =
-    getSessionToken(req);
+  if (matchedPattern) {
+    writeLog(
+      'WAF_BLOCK',
+      '의심스러운 요청이 감지되어 차단했습니다.',
+      req,
+      {
+        reason: matchedPattern.name,
+      }
+    );
 
-  if (!token) {
-    return res.status(401).json({
+    return res.status(403).json({
       success: false,
-
-      message:
-        '로그인이 필요합니다.',
+      message: 'WAF에 의해 요청이 차단되었습니다.',
+      reason: matchedPattern.name,
     });
   }
 
-  const session =
-    sessions.get(token);
+  /*
+  |--------------------------------------------------------------------------
+  | 정상 요청
+  |--------------------------------------------------------------------------
+  */
 
-  if (!session) {
-    return res.status(401).json({
-      success: false,
-
-      message:
-        '세션이 만료되었거나 존재하지 않습니다.',
-    });
-  }
-
-  req.username =
-    session.username;
-
-  req.sessionToken =
-    token;
+  writeLog(
+    'WAF_ALLOW',
+    '정상 요청으로 판단했습니다.',
+    req
+  );
 
   next();
 }
 
-// ============================================================
-// 회원가입 API
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| Rate Limiting Middleware
+|--------------------------------------------------------------------------
+*/
 
-app.post(
-  '/api/signup',
-  async (req, res) => {
-    try {
-      const username =
-        String(
-          req.body.username || ''
-        ).trim();
+function loginRateLimit(req, res, next) {
+  const ip = req.ip;
+  const now = Date.now();
 
-      const password =
-        String(
-          req.body.password || ''
-        );
+  let record = loginAttempts.get(ip);
 
-      // ------------------------------------------------------
-      // 아이디 검사
-      // ------------------------------------------------------
+  /*
+  |--------------------------------------------------------------------------
+  | 처음 요청한 IP
+  |--------------------------------------------------------------------------
+  */
 
-      if (
-        !isValidUsername(
-          username
-        )
-      ) {
-        writeSecurityLog(
-          'SIGNUP_REJECT',
-          req,
-          {
-            username,
+  if (!record) {
+    record = {
+      count: 0,
+      firstRequest: now,
+    };
 
-            reason:
-              'INVALID_USERNAME',
-          }
-        );
-
-        return res.status(400).json({
-          success: false,
-
-          message:
-            '아이디는 영문, 숫자, _만 사용할 수 있으며 4~20자여야 합니다.',
-        });
-      }
-
-      // ------------------------------------------------------
-      // 비밀번호 검사
-      // ------------------------------------------------------
-
-      if (
-        !isValidPassword(
-          password
-        )
-      ) {
-        writeSecurityLog(
-          'SIGNUP_REJECT',
-          req,
-          {
-            username,
-
-            reason:
-              'WEAK_PASSWORD',
-          }
-        );
-
-        return res.status(400).json({
-          success: false,
-
-          message:
-            '비밀번호는 8자 이상이어야 합니다.',
-        });
-      }
-
-      const data =
-        readUsers();
-
-      // ------------------------------------------------------
-      // 아이디 중복 확인
-      // ------------------------------------------------------
-
-      const exists =
-        data.users.some(
-          (user) =>
-            user.username.toLowerCase() ===
-            username.toLowerCase()
-        );
-
-      if (exists) {
-        writeSecurityLog(
-          'SIGNUP_REJECT',
-          req,
-          {
-            username,
-
-            reason:
-              'USERNAME_EXISTS',
-          }
-        );
-
-        return res.status(409).json({
-          success: false,
-
-          message:
-            '이미 존재하는 아이디입니다.',
-        });
-      }
-
-      // ------------------------------------------------------
-      // 비밀번호 해시
-      // ------------------------------------------------------
-
-      const passwordData =
-        await hashPassword(
-          password
-        );
-
-      // ------------------------------------------------------
-      // 사용자 생성
-      // ------------------------------------------------------
-
-      const newUser = {
-        username,
-
-        password:
-          passwordData,
-
-        loginFailures: 0,
-
-        lockedUntil: null,
-
-        createdAt:
-          new Date().toISOString(),
-
-        lastLoginAt: null,
-      };
-
-      data.users.push(
-        newUser
-      );
-
-      saveUsers(data);
-
-      // ------------------------------------------------------
-      // 회원가입 성공 로그
-      // ------------------------------------------------------
-
-      writeSecurityLog(
-        'SIGNUP_SUCCESS',
-        req,
-        {
-          username,
-        }
-      );
-
-      return res.status(201).json({
-        success: true,
-
-        message:
-          '회원가입이 완료되었습니다.',
-      });
-    } catch (error) {
-      console.error(
-        '회원가입 오류:',
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-
-        message:
-          '회원가입 처리 중 오류가 발생했습니다.',
-      });
-    }
+    loginAttempts.set(ip, record);
   }
-);
 
-// ============================================================
-// 로그인 API
-// ============================================================
-
-app.post(
-  '/api/login',
-  async (req, res) => {
-    try {
-      const username =
-        String(
-          req.body.username || ''
-        ).trim();
-
-      const password =
-        String(
-          req.body.password || ''
-        );
-
-      const clientIp =
-        getClientIp(req);
-
-      // ------------------------------------------------------
-      // 1. IP 차단 확인
-      // ------------------------------------------------------
-
-      if (
-        isIpBlocked(
-          clientIp
-        )
-      ) {
-        const blockedUntil =
-          blockedIps.get(
-            clientIp
-          );
-
-        writeSecurityLog(
-          'IP_BLOCKED',
-          req,
-          {
-            username,
-
-            reason:
-              'TOO_MANY_LOGIN_ATTEMPTS',
-
-            ipFailures:
-              getIpFailureCount(
-                clientIp
-              ),
-
-            blockedUntil:
-              blockedUntil
-                ? new Date(
-                    blockedUntil
-                  ).toISOString()
-                : null,
-          }
-        );
-
-        return res
-          .status(429)
-          .json({
-            success: false,
-
-            message:
-              '비정상적인 로그인 시도가 감지되어 현재 IP의 접근이 일시적으로 제한되었습니다.',
-          });
-      }
-
-      const data =
-        readUsers();
-
-      // ------------------------------------------------------
-      // 2. 사용자 찾기
-      // ------------------------------------------------------
-
-      const user =
-        data.users.find(
-          (item) =>
-            item.username.toLowerCase() ===
-            username.toLowerCase()
-        );
-
-      // ------------------------------------------------------
-      // 3. 존재하지 않는 계정
-      // ------------------------------------------------------
-
-      if (!user) {
-        const ipFailures =
-          registerIpFailure(
-            clientIp
-          );
-
-        writeSecurityLog(
-          'LOGIN_FAIL',
-          req,
-          {
-            username,
-
-            reason:
-              'INVALID_CREDENTIALS',
-
-            ipFailures,
-          }
-        );
-
-        // IP 실패 횟수 확인
-        if (
-          ipFailures >=
-          MAX_IP_FAILURES
-        ) {
-          const blockedUntil =
-            blockIp(
-              clientIp
-            );
-
-          writeSecurityLog(
-            'IP_BLOCKED',
-            req,
-            {
-              username,
-
-              reason:
-                'TOO_MANY_LOGIN_ATTEMPTS',
-
-              ipFailures,
-
-              blockedUntil:
-                new Date(
-                  blockedUntil
-                ).toISOString(),
-            }
-          );
-
-          return res
-            .status(429)
-            .json({
-              success: false,
-
-              message:
-                `로그인 시도가 너무 많아 이 IP를 ${IP_BLOCK_MINUTES}분간 제한했습니다.`,
-            });
-        }
-
-        return res
-          .status(401)
-          .json({
-            success: false,
-
-            message:
-              '아이디 또는 비밀번호가 올바르지 않습니다.',
-          });
-      }
-
-      // ------------------------------------------------------
-      // 4. 계정 잠금 확인
-      // ------------------------------------------------------
-
-      if (
-        user.lockedUntil
-      ) {
-        const lockedUntil =
-          new Date(
-            user.lockedUntil
-          ).getTime();
-
-        // 아직 잠겨 있음
-        if (
-          lockedUntil >
-          Date.now()
-        ) {
-          const remainingSeconds =
-            Math.ceil(
-              (lockedUntil -
-                Date.now()) /
-                1000
-            );
-
-          writeSecurityLog(
-            'LOGIN_BLOCKED',
-            req,
-            {
-              username:
-                user.username,
-
-              reason:
-                'ACCOUNT_LOCKED',
-
-              lockedUntil:
-                user.lockedUntil,
-            }
-          );
-
-          return res
-            .status(423)
-            .json({
-              success: false,
-
-              message:
-                `계정이 잠겨 있습니다. 약 ${remainingSeconds}초 후 다시 시도하세요.`,
-            });
-        }
-
-        // 잠금 시간이 끝난 경우
-        user.lockedUntil =
-          null;
-
-        user.loginFailures =
-          0;
-
-        saveUsers(data);
-      }
-
-      // ------------------------------------------------------
-      // 5. 비밀번호 확인
-      // ------------------------------------------------------
-
-      const passwordCorrect =
-        await verifyPassword(
-          password,
-          user.password
-        );
-
-      // ------------------------------------------------------
-      // 6. 비밀번호 실패
-      // ------------------------------------------------------
-
-      if (
-        !passwordCorrect
-      ) {
-        user.loginFailures +=
-          1;
-
-        const ipFailures =
-          registerIpFailure(
-            clientIp
-          );
-
-        // ====================================================
-        // 계정 잠금
-        // ====================================================
-
-        if (
-          user.loginFailures >=
-          MAX_LOGIN_FAILURES
-        ) {
-          const lockedUntil =
-            new Date(
-              Date.now() +
-                ACCOUNT_LOCK_MINUTES *
-                  60 *
-                  1000
-            );
-
-          user.lockedUntil =
-            lockedUntil.toISOString();
-
-          saveUsers(data);
-
-          writeSecurityLog(
-            'ACCOUNT_LOCKED',
-            req,
-            {
-              username:
-                user.username,
-
-              reason:
-                'TOO_MANY_LOGIN_FAILURES',
-
-              failures:
-                user.loginFailures,
-
-              ipFailures,
-
-              lockedUntil:
-                user.lockedUntil,
-            }
-          );
-
-          // IP도 기준에 도달했다면 차단
-          if (
-            ipFailures >=
-            MAX_IP_FAILURES
-          ) {
-            const blockedUntil =
-              blockIp(
-                clientIp
-              );
-
-            writeSecurityLog(
-              'IP_BLOCKED',
-              req,
-              {
-                username:
-                  user.username,
-
-                reason:
-                  'TOO_MANY_LOGIN_ATTEMPTS',
-
-                ipFailures,
-
-                blockedUntil:
-                  new Date(
-                    blockedUntil
-                  ).toISOString(),
-              }
-            );
-          }
-
-          return res
-            .status(423)
-            .json({
-              success: false,
-
-              message:
-                `로그인 실패가 ${MAX_LOGIN_FAILURES}회 발생하여 계정을 ${ACCOUNT_LOCK_MINUTES}분간 잠갔습니다.`,
-            });
-        }
-
-        saveUsers(data);
-
-        writeSecurityLog(
-          'LOGIN_FAIL',
-          req,
-          {
-            username:
-              user.username,
-
-            reason:
-              'INVALID_PASSWORD',
-
-            failures:
-              user.loginFailures,
-
-            ipFailures,
-          }
-        );
-
-        // ====================================================
-        // IP 차단
-        // ====================================================
-
-        if (
-          ipFailures >=
-          MAX_IP_FAILURES
-        ) {
-          const blockedUntil =
-            blockIp(
-              clientIp
-            );
-
-          writeSecurityLog(
-            'IP_BLOCKED',
-            req,
-            {
-              username:
-                user.username,
-
-              reason:
-                'TOO_MANY_LOGIN_ATTEMPTS',
-
-              ipFailures,
-
-              blockedUntil:
-                new Date(
-                  blockedUntil
-                ).toISOString(),
-            }
-          );
-
-          return res
-            .status(429)
-            .json({
-              success: false,
-
-              message:
-                `로그인 시도가 너무 많아 이 IP를 ${IP_BLOCK_MINUTES}분간 제한했습니다.`,
-            });
-        }
-
-        const accountRemaining =
-          MAX_LOGIN_FAILURES -
-          user.loginFailures;
-
-        return res
-          .status(401)
-          .json({
-            success: false,
-
-            message:
-              `비밀번호가 올바르지 않습니다. 계정 남은 시도: ${accountRemaining}회`,
-          });
-      }
-
-      // ------------------------------------------------------
-      // 7. 로그인 성공
-      // ------------------------------------------------------
-
-      user.loginFailures =
-        0;
-
-      user.lockedUntil =
-        null;
-
-      user.lastLoginAt =
-        new Date().toISOString();
-
-      saveUsers(data);
-
-      // 정상 로그인했으므로 해당 IP 실패 기록 초기화
-      ipLoginFailures.delete(
-        clientIp
-      );
-
-      // ------------------------------------------------------
-      // 세션 생성
-      // ------------------------------------------------------
-
-      const sessionToken =
-        createSession(
-          user.username
-        );
-
-      // ------------------------------------------------------
-      // HttpOnly 쿠키
-      // ------------------------------------------------------
-
-      res.setHeader(
-        'Set-Cookie',
-        `session=${sessionToken}; HttpOnly; Path=/; SameSite=Lax`
-      );
-
-      // ------------------------------------------------------
-      // 성공 로그
-      // ------------------------------------------------------
-
-      writeSecurityLog(
-        'LOGIN_SUCCESS',
-        req,
-        {
-          username:
-            user.username,
-        }
-      );
-
-      return res.json({
-        success: true,
-
-        message:
-          '로그인에 성공했습니다.',
-
-        username:
-          user.username,
-      });
-    } catch (error) {
-      console.error(
-        '로그인 오류:',
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-
-        message:
-          '로그인 처리 중 오류가 발생했습니다.',
-      });
-    }
+  /*
+  |--------------------------------------------------------------------------
+  | 1분이 지나면 기록 초기화
+  |--------------------------------------------------------------------------
+  */
+
+  if (now - record.firstRequest >= RATE_LIMIT_WINDOW) {
+    record.count = 0;
+    record.firstRequest = now;
   }
-);
 
-// ============================================================
-// 로그아웃
-// ============================================================
+  /*
+  |--------------------------------------------------------------------------
+  | 요청 횟수 증가
+  |--------------------------------------------------------------------------
+  */
 
-app.post(
-  '/api/logout',
-  (req, res) => {
-    const token =
-      getSessionToken(req);
+  record.count++;
 
-    if (token) {
-      const session =
-        sessions.get(token);
+  /*
+  |--------------------------------------------------------------------------
+  | 요청 횟수 초과
+  |--------------------------------------------------------------------------
+  */
 
-      sessions.delete(token);
-
-      writeSecurityLog(
-        'LOGOUT',
-        req,
-        {
-          username:
-            session?.username ||
-            null,
-        }
-      );
-    } else {
-      writeSecurityLog(
-        'LOGOUT',
-        req
-      );
-    }
-
-    res.setHeader(
-      'Set-Cookie',
-      'session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax'
+  if (record.count > MAX_LOGIN_ATTEMPTS) {
+    writeLog(
+      'RATE_LIMIT_BLOCK',
+      '로그인 요청 횟수가 너무 많아 요청을 차단했습니다.',
+      req,
+      {
+        reason: 'TOO_MANY_LOGIN_REQUESTS',
+        attempts: record.count,
+      }
     );
 
-    return res.json({
-      success: true,
-
-      message:
-        '로그아웃되었습니다.',
-    });
-  }
-);
-
-// ============================================================
-// 현재 로그인 사용자
-// ============================================================
-
-app.get(
-  '/api/me',
-  requireLogin,
-  (req, res) => {
-    return res.json({
-      success: true,
-
-      username:
-        req.username,
-    });
-  }
-);
-
-// ============================================================
-// 보호된 API
-// ============================================================
-
-app.get(
-  '/api/protected',
-  requireLogin,
-  (req, res) => {
-    return res.json({
-      success: true,
-
-      message:
-        `${req.username}님, 보호된 API에 접근했습니다.`,
-    });
-  }
-);
-
-// ============================================================
-// 보안 로그 조회
-// ============================================================
-
-app.get(
-  '/api/security-logs',
-  (req, res) => {
-    try {
-      const raw =
-        fs.readFileSync(
-          SECURITY_LOG_FILE,
-          'utf8'
-        );
-
-      const logs =
-        raw
-          .split('\n')
-          .filter(Boolean)
-          .slice(-100)
-          .map((line) => {
-            try {
-              return JSON.parse(
-                line
-              );
-            } catch {
-              return {
-                raw: line,
-              };
-            }
-          });
-
-      return res.json({
-        success: true,
-
-        count:
-          logs.length,
-
-        logs,
-      });
-    } catch (error) {
-      console.error(
-        '보안 로그 읽기 오류:',
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-
-        message:
-          '보안 로그를 읽을 수 없습니다.',
-      });
-    }
-  }
-);
-
-// ============================================================
-// IP 상태 확인 API
-// ============================================================
-
-app.get(
-  '/api/security-status',
-  (req, res) => {
-    const ip =
-      getClientIp(req);
-
-    const blocked =
-      isIpBlocked(ip);
-
-    const failureCount =
-      getIpFailureCount(ip);
-
-    const blockedUntil =
-      blockedIps.get(ip);
-
-    return res.json({
-      success: true,
-
-      ip,
-
-      blocked,
-
-      failureCount,
-
-      blockedUntil:
-        blockedUntil
-          ? new Date(
-              blockedUntil
-            ).toISOString()
-          : null,
-
-      policy: {
-        maxIpFailures:
-          MAX_IP_FAILURES,
-
-        blockMinutes:
-          IP_BLOCK_MINUTES,
-      },
-    });
-  }
-);
-
-// ============================================================
-// 메인 화면
-// ============================================================
-
-app.get(
-  '/',
-  (req, res) => {
-    res.sendFile(
-      path.join(
-        __dirname,
-        'index.html'
-      )
-    );
-  }
-);
-
-// ============================================================
-// 404
-// ============================================================
-
-app.use(
-  (req, res) => {
-    res.status(404).json({
+    return res.status(429).json({
       success: false,
-
       message:
-        '존재하지 않는 경로입니다.',
+        '로그인 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.',
     });
   }
-);
 
-// ============================================================
-// 서버 실행
-// ============================================================
+  next();
+}
 
-app.listen(
-  PORT,
-  () => {
-    console.log(
-      '========================================'
-    );
+/*
+|--------------------------------------------------------------------------
+| WAF 적용
+|--------------------------------------------------------------------------
+*/
 
-    console.log(
-      ' Secure Login Lab'
-    );
+app.use(wafMiddleware);
 
-    console.log(
-      ' Node.js + Express + scrypt'
-    );
+/*
+|--------------------------------------------------------------------------
+| 메인 페이지
+|--------------------------------------------------------------------------
+*/
 
-    console.log(
-      ' Account + IP Protection'
-    );
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
 
-    console.log(
-      '========================================'
-    );
+/*
+|--------------------------------------------------------------------------
+| 로그인 페이지
+|--------------------------------------------------------------------------
+*/
 
-    console.log(
-      `http://localhost:${PORT}`
-    );
-  }
-);
+app.get('/login', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+/*
+|--------------------------------------------------------------------------
+| 대시보드
+|--------------------------------------------------------------------------
+*/
+
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dashboard.html'));
+});
+
+/*
+|--------------------------------------------------------------------------
+| 설정 페이지
+|--------------------------------------------------------------------------
+*/
+
+app.get('/settings', (req, res) => {
+  res.sendFile(path.join(__dirname, 'settings.html'));
+});
+
+/*
+|--------------------------------------------------------------------------
+| Hello API
+|--------------------------------------------------------------------------
+*/
+
+app.get('/hello', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Hello Node.js!',
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| 검색 API
+|--------------------------------------------------------------------------
+*/
+
+app.get('/search', (req, res) => {
+  const keyword = req.query.keyword || '';
+
+  res.json({
+    success: true,
+    keyword,
+    message: '검색 요청이 정상적으로 처리되었습니다.',
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| 로그인 처리
+|--------------------------------------------------------------------------
+*/
+
+function loginHandler(req, res) {
+  const { username } = req.body;
+
+  writeLog(
+    'LOGIN_REQUEST',
+    '로그인 요청이 서버에 도착했습니다.',
+    req,
+    {
+      username: username || '',
+    }
+  );
+
+  res.json({
+    success: true,
+    username: username || null,
+    message: '로그인 요청이 서버에 도착했습니다.',
+  });
+}
+
+/*
+|--------------------------------------------------------------------------
+| 로그인 API
+|--------------------------------------------------------------------------
+*/
+
+app.post('/login', loginRateLimit, loginHandler);
+
+app.post('/api/login', loginRateLimit, loginHandler);
+
+/*
+|--------------------------------------------------------------------------
+| 로그 조회 API
+|--------------------------------------------------------------------------
+|
+| 전체
+| /logs
+|
+| 타입 검색
+| /logs?type=WAF_BLOCK
+|
+| 로그인 검색
+| /logs?type=LOGIN_REQUEST
+|
+| Rate Limit 검색
+| /logs?type=RATE_LIMIT_BLOCK
+|
+| IP 검색
+| /logs?ip=::1
+|
+|--------------------------------------------------------------------------
+*/
+
+app.get('/logs', (req, res) => {
+  fs.readFile(LOG_FILE, 'utf8', (error, data) => {
+    if (error) {
+      console.error('로그 읽기 실패:', error);
+
+      return res.status(500).json({
+        success: false,
+        message: '로그 파일을 읽을 수 없습니다.',
+      });
+    }
+
+    const type = req.query.type;
+    const ip = req.query.ip;
+
+    let logs = data
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return {
+            raw: line,
+          };
+        }
+      });
+
+    /*
+    |--------------------------------------------------------------------------
+    | 로그 종류 필터
+    |--------------------------------------------------------------------------
+    */
+
+    if (type) {
+      logs = logs.filter((log) => log.type === type);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | IP 필터
+    |--------------------------------------------------------------------------
+    */
+
+    if (ip) {
+      logs = logs.filter((log) => log.ip === ip);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | 최근 100개
+    |--------------------------------------------------------------------------
+    */
+
+    logs = logs.slice(-100);
+
+    res.json({
+      success: true,
+      count: logs.length,
+
+      filter: {
+        type: type || null,
+        ip: ip || null,
+      },
+
+      logs,
+    });
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| 로그 통계 함수
+|--------------------------------------------------------------------------
+*/
+
+function getLogStats(req, res) {
+  fs.readFile(LOG_FILE, 'utf8', (error, data) => {
+    if (error) {
+      console.error('로그 읽기 실패:', error);
+
+      return res.status(500).json({
+        success: false,
+        message: '로그 파일을 읽을 수 없습니다.',
+      });
+    }
+
+    const logs = data
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    const stats = {
+      total: logs.length,
+      wafAllow: 0,
+      wafBlock: 0,
+      loginRequest: 0,
+      loginFail: 0,
+      loginSuccess: 0,
+      rateLimitBlock: 0,
+    };
+
+    /*
+    |--------------------------------------------------------------------------
+    | 로그 종류별 통계
+    |--------------------------------------------------------------------------
+    */
+
+    logs.forEach((log) => {
+      switch (log.type) {
+        case 'WAF_ALLOW':
+          stats.wafAllow++;
+          break;
+
+        case 'WAF_BLOCK':
+          stats.wafBlock++;
+          break;
+
+        case 'LOGIN_REQUEST':
+          stats.loginRequest++;
+          break;
+
+        case 'LOGIN_FAIL':
+          stats.loginFail++;
+          break;
+
+        case 'LOGIN_SUCCESS':
+          stats.loginSuccess++;
+          break;
+
+        case 'RATE_LIMIT_BLOCK':
+          stats.rateLimitBlock++;
+          break;
+      }
+    });
+
+    res.json({
+      success: true,
+      stats,
+    });
+  });
+}
+
+/*
+|--------------------------------------------------------------------------
+| 통계 API
+|--------------------------------------------------------------------------
+*/
+
+app.get('/logs/stats', getLogStats);
+
+app.get('/stats', getLogStats);
+
+/*
+|--------------------------------------------------------------------------
+| 404 처리
+|--------------------------------------------------------------------------
+*/
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: '존재하지 않는 API입니다.',
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| 서버 실행
+|--------------------------------------------------------------------------
+*/
+
+app.listen(PORT, () => {
+  console.log('====================================');
+  console.log(' Security Log Lab');
+  console.log(' Node.js + WAF + Rate Limiting');
+  console.log('====================================');
+  console.log(`Server: http://localhost:${PORT}`);
+});
