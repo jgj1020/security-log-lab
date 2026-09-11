@@ -80,3 +80,12 @@
 
 ```text
 http://localhost:3000/logs
+
+메인 페이지
+http://localhost:3000/
+
+보안 대시보드
+http://localhost:3000/dashboard
+
+설정 페이지
+http://localhost:3000/settings
