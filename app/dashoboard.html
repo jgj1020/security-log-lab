@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Security Log Dashboard</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    :root {
+      --bg: #070b14;
+      --panel: rgba(16, 24, 40, 0.86);
+      --panel-2: rgba(21, 31, 51, 0.72);
+      --border: rgba(148, 163, 184, 0.16);
+      --text: #eef2ff;
+      --muted: #94a3b8;
+      --cyan: #22d3ee;
+      --green: #4ade80;
+      --red: #fb7185;
+      --yellow: #facc15;
+      --purple: #a78bfa;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family:
+        Inter, Pretendard, "Noto Sans KR", system-ui, -apple-system,
+        BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 15% 0%, rgba(34, 211, 238, 0.11), transparent 28%),
+        radial-gradient(circle at 90% 10%, rgba(167, 139, 250, 0.11), transparent 30%),
+        linear-gradient(180deg, #060914 0%, var(--bg) 100%);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(148, 163, 184, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148, 163, 184, 0.035) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(to bottom, transparent, black 12%, black 80%, transparent);
+    }
+
+    .shell {
+      width: min(1400px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 48px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      padding: 7px 11px;
+      border: 1px solid rgba(34, 211, 238, 0.22);
+      border-radius: 999px;
+      background: rgba(34, 211, 238, 0.07);
+      color: #67e8f9;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 14px rgba(74, 222, 128, 0.8);
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+
+    h1 {
+      margin: 14px 0 6px;
+      font-size: clamp(30px, 4vw, 50px);
+      line-height: 1;
+      letter-spacing: -0.045em;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .status {
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.72);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .status strong {
+      color: var(--green);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    .card {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: linear-gradient(180deg, var(--panel), rgba(8, 15, 28, 0.78));
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
+      backdrop-filter: blur(16px);
+    }
+
+    .stat {
+      padding: 20px;
+    }
+
+    .stat::after {
+      content: "";
+      position: absolute;
+      right: -30px;
+      bottom: -45px;
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      background: rgba(34, 211, 238, 0.06);
+      filter: blur(10px);
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .value {
+      margin-top: 9px;
+      font-size: 34px;
+      font-weight: 900;
+      letter-spacing: -0.04em;
+    }
+
+    .accent-cyan { color: var(--cyan); }
+    .accent-green { color: var(--green); }
+    .accent-red { color: var(--red); }
+    .accent-yellow { color: var(--yellow); }
+
+    .main {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    .panel {
+      padding: 20px;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 900;
+    }
+
+    .panel-meta {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .bars {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 8px;
+      height: 180px;
+      align-items: end;
+      padding-top: 12px;
+    }
+
+    .bar-col {
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      height: 100%;
+      position: relative;
+    }
+
+    .bar {
+      width: 100%;
+      min-height: 4px;
+      border-radius: 8px 8px 3px 3px;
+      background: linear-gradient(180deg, #67e8f9, #2563eb);
+      box-shadow: 0 0 20px rgba(34, 211, 238, 0.18);
+      transition: height 0.35s ease;
+    }
+
+    .bar-label {
+      position: absolute;
+      bottom: -22px;
+      color: #64748b;
+      font-size: 9px;
+    }
+
+    .attack-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .attack-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.55);
+    }
+
+    .attack-name {
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .attack-count {
+      min-width: 36px;
+      padding: 5px 8px;
+      border-radius: 999px;
+      background: rgba(251, 113, 133, 0.1);
+      color: var(--red);
+      text-align: center;
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .logs {
+      padding: 0;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+    }
+
+    th,
+    td {
+      padding: 13px 16px;
+      border-top: 1px solid var(--border);
+      text-align: left;
+      font-size: 12px;
+      vertical-align: middle;
+    }
+
+    th {
+      color: #64748b;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    td {
+      color: #dbe4f0;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 8px;
+      border-radius: 999px;
+      font-size: 9px;
+      font-weight: 900;
+    }
+
+    .allow {
+      color: var(--green);
+      background: rgba(74, 222, 128, 0.1);
+      border: 1px solid rgba(74, 222, 128, 0.14);
+    }
+
+    .block {
+      color: var(--red);
+      background: rgba(251, 113, 133, 0.1);
+      border: 1px solid rgba(251, 113, 133, 0.14);
+    }
+
+    .reason {
+      color: #c4b5fd;
+      font-weight: 700;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      word-break: break-all;
+    }
+
+    .empty {
+      padding: 30px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .footer-note {
+      margin-top: 12px;
+      color: #64748b;
+      font-size: 11px;
+      text-align: right;
+    }
+
+    @keyframes pulse {
+      0%, 100% { transform: scale(0.8); opacity: 0.55; }
+      50% { transform: scale(1.3); opacity: 1; }
+    }
+
+    @media (max-width: 1000px) {
+      .grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .main {
+        grid-template-columns: 1fr;
+      }
+
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .shell {
+        width: min(100% - 20px, 1400px);
+        padding-top: 20px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .panel,
+      .stat {
+        padding: 15px;
+      }
+
+      .value {
+        font-size: 28px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">
+          <span class="dot"></span>
+          SECURITY MONITOR
+        </div>
+        <h1>보안 관제 대시보드</h1>
+        <p class="subtitle">Node.js + WAF · security.log 실시간 분석</p>
+      </div>
+
+      <div class="status">
+        API 상태: <strong id="apiStatus">연결 중...</strong>
+      </div>
+    </header>
+
+    <section class="grid">
+      <article class="card stat">
+        <div class="label">Total Requests</div>
+        <div class="value accent-cyan" id="totalCount">0</div>
+      </article>
+
+      <article class="card stat">
+        <div class="label">Allowed</div>
+        <div class="value accent-green" id="allowCount">0</div>
+      </article>
+
+      <article class="card stat">
+        <div class="label">Blocked</div>
+        <div class="value accent-red" id="blockCount">0</div>
+      </article>
+
+      <article class="card stat">
+        <div class="label">Attack Types</div>
+        <div class="value accent-yellow" id="attackTypeCount">0</div>
+      </article>
+    </section>
+
+    <section class="main">
+      <article class="card panel">
+        <div class="panel-head">
+          <h2 class="panel-title">최근 요청 추이</h2>
+          <span class="panel-meta">최근 12개 구간</span>
+        </div>
+
+        <div class="bars" id="bars"></div>
+        <div class="footer-note">페이지를 열어둔 동안 1.5초마다 갱신</div>
+      </article>
+
+      <article class="card panel">
+        <div class="panel-head">
+          <h2 class="panel-title">공격 유형</h2>
+          <span class="panel-meta">차단 로그 기준</span>
+        </div>
+
+        <div class="attack-list" id="attackList">
+          <div class="empty">데이터를 불러오는 중...</div>
+        </div>
+      </article>
+    </section>
+
+    <section class="card logs">
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">실시간 보안 로그</h2>
+          <span class="panel-meta" id="logMeta">0 records</span>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Result</th>
+              <th>Method</th>
+              <th>Path</th>
+              <th>IP</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="logBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const MAX_LOGS = 100;
+    const REFRESH_MS = 1500;
+
+    function formatTime(iso) {
+      if (!iso) return "-";
+
+      const date = new Date(iso);
+
+      return date.toLocaleTimeString("ko-KR", {
+        hour12: false,
+      });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function renderStats(logs) {
+      const allow = logs.filter((log) => log.type === "WAF_ALLOW").length;
+      const block = logs.filter((log) => log.type === "WAF_BLOCK").length;
+
+      const reasons = new Set(
+        logs
+          .filter((log) => log.type === "WAF_BLOCK")
+          .map((log) => log.reason)
+          .filter(Boolean)
+      );
+
+      document.getElementById("totalCount").textContent = logs.length;
+      document.getElementById("allowCount").textContent = allow;
+      document.getElementById("blockCount").textContent = block;
+      document.getElementById("attackTypeCount").textContent = reasons.size;
+
+      document.getElementById("logMeta").textContent =
+        `${logs.length} records`;
+    }
+
+    function renderAttackTypes(logs) {
+      const counts = {};
+
+      logs
+        .filter((log) => log.type === "WAF_BLOCK")
+        .forEach((log) => {
+          const reason = log.reason || "UNKNOWN";
+          counts[reason] = (counts[reason] || 0) + 1;
+        });
+
+      const sorted = Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6);
+
+      const container = document.getElementById("attackList");
+
+      if (!sorted.length) {
+        container.innerHTML = `
+          <div class="empty">
+            현재 차단된 공격 로그가 없습니다.
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = sorted
+        .map(([name, count]) => `
+          <div class="attack-row">
+            <div class="attack-name">${escapeHtml(name)}</div>
+            <div class="attack-count">${count}</div>
+          </div>
+        `)
+        .join("");
+    }
+
+    function renderBars(logs) {
+      const container = document.getElementById("bars");
+
+      const buckets = Array.from({ length: 12 }, () => 0);
+
+      const recent = logs.slice(-12);
+
+      recent.forEach((log, index) => {
+        buckets[index + (12 - recent.length)] += 1;
+      });
+
+      const max = Math.max(...buckets, 1);
+
+      container.innerHTML = buckets
+        .map((count, index) => {
+          const height = Math.max((count / max) * 100, count > 0 ? 12 : 4);
+
+          return `
+            <div class="bar-col">
+              <div
+                class="bar"
+                style="height: ${height}%"
+                title="${count} requests"
+              ></div>
+              <div class="bar-label">${index + 1}</div>
+            </div>
+          `;
+        })
+        .join("");
+    }
+
+    function renderLogs(logs) {
+      const body = document.getElementById("logBody");
+
+      const recent = [...logs].reverse().slice(0, MAX_LOGS);
+
+      if (!recent.length) {
+        body.innerHTML = `
+          <tr>
+            <td colspan="6" class="empty">
+              아직 로그가 없습니다.
+            </td>
+          </tr>
+        `;
+        return;
+      }
+
+      body.innerHTML = recent
+        .map((log) => {
+          const blocked = log.type === "WAF_BLOCK";
+
+          return `
+            <tr>
+              <td>${escapeHtml(formatTime(log.time))}</td>
+              <td>
+                <span class="badge ${blocked ? "block" : "allow"}">
+                  ${blocked ? "BLOCK" : "ALLOW"}
+                </span>
+              </td>
+              <td>${escapeHtml(log.method)}</td>
+              <td class="mono">${escapeHtml(log.path)}</td>
+              <td class="mono">${escapeHtml(log.ip)}</td>
+              <td class="${blocked ? "reason" : ""}">
+                ${escapeHtml(log.reason || "-")}
+              </td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+
+    async function loadLogs() {
+      try {
+        const response = await fetch("/logs", {
+          cache: "no-store",
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (!data.success) {
+          throw new Error("로그 API 오류");
+        }
+
+        document.getElementById("apiStatus").textContent = "정상";
+
+        renderStats(data.logs || []);
+        renderAttackTypes(data.logs || []);
+        renderBars(data.logs || []);
+        renderLogs(data.logs || []);
+      } catch (error) {
+        console.error(error);
+
+        document.getElementById("apiStatus").textContent = "오류";
+        document.getElementById("apiStatus").style.color = "#fb7185";
+      }
+    }
+
+    loadLogs();
+    setInterval(loadLogs, REFRESH_MS);
+  </script>
+</body>
+</html>
