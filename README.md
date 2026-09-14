@@ -1,6 +1,6 @@
 ## 📚 Learning Log
 
-<<<<<<< HEAD
+HEAD
 ![Secure Login Lab 서비스 실행 구조](./docs/architecture.png)
 
 ### 동작 흐름
@@ -96,9 +96,4 @@ docs/update-readme
 
 main
 ## 📚 학습 목적
-
 이 프로젝트는 SIEM 및 보안 로그 처리 구조를 이해하기 위한 학습용 프로젝트입니다.
-=======
-- [Day 01 - 보안 로그 시스템 기초](./docs/learning-log/day01.md)
-- [Day 02 - Security Event Monitor와 Kafka](./docs/learning-log/day02.md)
->>>>>>> 37ab6fe (docs: add learning logs)
