@@ -89,3 +89,9 @@ http://localhost:3000/dashboard
 
 설정 페이지
 http://localhost:3000/settings
+
+
+
+## 📚 학습 목적
+
+이 프로젝트는 SIEM 및 보안 로그 처리 구조를 이해하기 위한 학습용 프로젝트입니다.
